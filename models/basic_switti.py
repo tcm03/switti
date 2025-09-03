@@ -10,6 +10,8 @@ from torch.nn.functional import scaled_dot_product_attention  # q, k, v: BHLc
 from models.helpers import DropPath
 from models.rope import apply_rotary_emb
 
+import logging
+
 try:
     from flash_attn.ops.fused_dense import fused_mlp_func
 except ImportError:
@@ -194,30 +196,42 @@ class CrossAttention(nn.Module):
         self.caching, self.cached_k, self.cached_v = enable, None, None
 
     def forward(self, x, context, context_attn_bias=None, freqs_cis=None):
+        logging.info(f"@tcm In CrossAttention.forward(): x.shape = {x.shape}, context.shape = {context.shape}")
+        # [2025-09-03] @tcm: x.shape = [B, 4096, 1920]
+        # [2025-09-03] @tcm: context.shape = [B, 77, 2048]
         B, L, C = x.shape
         context_B, context_L, context_C = context.shape
         assert B == context_B
 
         q = self.to_q(x).view(B, L, -1)  # BLD , self.num_heads, self.head_dim)
+        logging.info(f"@tcm In CrossAttention.forward(): after to_q().view(), q.shape = {q.shape}")
+        # [2025-09-03] @tcm: q.shape = [B, 4096, 1920]
         if self.qk_norm:
             q = self.q_norm(q)
 
         q = q.view(B, L, self.num_heads, self.head_dim)
+        logging.info(f"@tcm In CrossAttention.forward(): after q.view(), q.shape = {q.shape}")
+        # [2025-09-03] @tcm: q.shape = [B, 4096, 30, 64]
         q = q.permute(0, 2, 1, 3)  # BHLc
-
+        logging.info(f"@tcm In CrossAttention.forward(): after q.permute(), q.shape = {q.shape}")
+        # [2025-09-03] @tcm: q.shape = [B, 30, 4096, 64]
         if self.cached_k is None:
             # not using caches or first scale inference
             kv = self.to_kv(context).view(B, context_L, 2, -1)  # qkv: BL3D
+            logging.info(f"@tcm In CrossAttention.forward(): after to_kv().view(), kv.shape = {kv.shape}")
             k, v = kv.permute(2, 0, 1, 3).unbind(dim=0)  # q or k or v: BLHD
+            logging.info(f"@tcm In CrossAttention.forward(): after to_kv().permute().unbind(), k.shape = {k.shape}, v.shape = {v.shape}")
 
             if self.qk_norm:
                 k = self.k_norm(k)
 
             k = k.view(B, context_L, self.num_heads, self.head_dim)
             k = k.permute(0, 2, 1, 3)  # BHLc
+            logging.info(f"@tcm In CrossAttention.forward(): after k.view().permute(), k.shape = {k.shape}")
 
             v = v.view(B, context_L, self.num_heads, self.head_dim)
             v = v.permute(0, 2, 1, 3)  # BHLc
+            logging.info(f"@tcm In CrossAttention.forward(): after v.view().permute(), v.shape = {v.shape}")
 
             if self.caching:
                 self.cached_k = k
@@ -355,6 +369,11 @@ class AdaLNSelfCrossAttn(nn.Module):
         assert attn_drop == 0.0
         assert qk_norm
 
+        # [2025-09-03] @tcm: embed_dim = 1920
+        # [2025-09-03] @tcm: cond_dim = 1920
+        # [2025-09-03] @tcm: num_heads = 30
+        # [2025-09-03] @tcm: context_dim = 2048
+
         self.block_idx, self.last_drop_p, self.C = block_idx, last_drop_p, embed_dim
         self.C, self.D = embed_dim, cond_dim
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -423,10 +442,16 @@ class AdaLNSelfCrossAttn(nn.Module):
         if self.use_crop_cond:
             assert crop_cond is not None
             cond_BD = cond_BD + self.crop_cond_scales * crop_cond
-            
+        
+        logging.info(f"@tcm In AdaLNSelfCrossAttn.forward(): ada_lin(cond_BD) shape = {self.ada_lin(cond_BD).shape}")
+        # [2025-09-03] @tcm: ada_lin(cond_BD).shape = [B, 11520]
+        logging.info(f"@tcm In AdaLNSelfCrossAttn.forward(): ada_lin(cond_BD).view(-1, 1, 6, self.C) shape: {self.ada_lin(cond_BD).view(-1, 1, 6, self.C).shape}")
+        # [2025-09-03] @tcm: ada_lin(cond_BD).view(-1, 1, 6, self.C) shape = [B, 1, 6, 1920]
         gamma1, gamma2, scale1, scale2, shift1, shift2 = (
             self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
         )
+        # logging.info(f"@tcm In AdaLNSelfCrossAttn.forward(): gamma1.shape = {gamma1.shape}, gamma2.shape = {gamma2.shape}, scale1.shape = {scale1.shape}, scale2.shape = {scale2.shape}, shift1.shape = {shift1.shape}, shift2.shape = {shift2.shape}")
+        # [2025-09-03] @tcm: gamma1,gamma2,scale1,scale2,shift1,shift2 shape = [B, 1, 1920]
         x = x + self.self_attention_norm2(
             self.attn(
                 self.self_attention_norm1(x).mul(scale1.add(1)).add(shift1),
@@ -434,6 +459,8 @@ class AdaLNSelfCrossAttn(nn.Module):
                 freqs_cis=freqs_cis,
             )
         ).mul(gamma1)
+        logging.info(f"@tcm In AdaLNSelfCrossAttn.forward(): after multi-head self-attn sub-block, x.shape = {x.shape}")
+        # [2025-09-03] @tcm: x.shape = [B, s, 1920], s \in switti.patch_nums
         if context is not None:
             x = x + self.cross_attention_norm2(
                 self.cross_attn(
@@ -443,6 +470,8 @@ class AdaLNSelfCrossAttn(nn.Module):
                     freqs_cis=freqs_cis,
                 )
             )
+        logging.info(f"@tcm In AdaLNSelfCrossAttn.forward(): after multi-head cross-attn sub-block, x.shape = {x.shape}")
+        # [2025-09-03] @tcm: x.shape = [B, s, 1920], s \in switti.patch_nums
         x = x + self.ffn_norm2(
             self.ffn(self.ffn_norm1(x).mul(scale2.add(1)).add(shift2))
         ).mul(gamma2)
